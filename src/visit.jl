@@ -12,6 +12,7 @@ end
 
 function _debug_log(msg::String)
     tid = Threads.threadid()
+    @info "[REVISE DEBUG] _debug_log called: tid=$tid msg=$msg"
     @lock _debug_log_lock begin
         _init_debug_logging()
         if !haskey(_debug_log_files, tid)
