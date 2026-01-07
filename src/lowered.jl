@@ -208,8 +208,11 @@ function methods_by_execution!(
         interp::Interpreter, exinfo::ExInfo, mod::Module, ex::Expr;
         mode::Symbol = :eval, disablebp::Bool = true, always_rethrow::Bool = false, kwargs...
     )
+    @info "[REVISE DEBUG] methods_by_execution! called" mod mode ex_summary=string(first(string(ex), 100))
     mode ∈ (:sigs, :eval, :evalmeth, :evalassign) || error("unsupported mode ", mode)
+    @info "[REVISE DEBUG] Lowering expression..."
     lwr = Meta.lower(mod, ex)
+    @info "[REVISE DEBUG] Lowering complete" lwr_type=typeof(lwr) lwr_head=(lwr isa Expr ? lwr.head : nothing)
     isa(lwr, Expr) || return Pair{Any,Union{Nothing,Expr}}(nothing, nothing)
     if lwr.head === :error || lwr.head === :incomplete
         throw(LoweringException(lwr))
@@ -218,10 +221,13 @@ function methods_by_execution!(
         mode === :sigs && return Pair{Any,Union{Nothing,Expr}}(nothing, nothing)
         return Pair{Any,Union{Nothing,Expr}}(Core.eval(mod, lwr), nothing)
     end
+    @info "[REVISE DEBUG] Creating frame..."
     frame = Frame(mod, lwr.args[1]::CodeInfo)
     mode === :eval || LoweredCodeUtils.rename_framemethods!(interp, frame)
     # Determine whether we need interpreted mode
+    @info "[REVISE DEBUG] Calling minimal_evaluation!..."
     isrequired, evalassign = minimal_evaluation!(frame, mode)
+    @info "[REVISE DEBUG] minimal_evaluation! returned" any_required=any(isrequired) evalassign
     # LoweredCodeUtils.print_with_code(stdout, frame.framecode.src, isrequired)
     if !any(isrequired) && (mode === :eval || !evalassign)
         # We can evaluate the entire expression in compiled mode
@@ -271,10 +277,14 @@ end
 methods_by_execution!(exinfo::ExInfo, mod::Module, ex::Expr; kwargs...) =
     methods_by_execution!(Compiled(), exinfo, mod, ex; kwargs...)
 
+const _mbe_iteration_count = Ref(0)
+const _mbe_max_iterations = 10000
+
 function _methods_by_execution!(
         interp::Interpreter, exinfo::ExInfo, frame::Frame, isrequired::AbstractVector{Bool};
         mode::Symbol = :eval, skip_include::Bool = true
     )
+    @info "[REVISE DEBUG] _methods_by_execution! ENTER" mode skip_include code_length=length(frame.framecode.src.code)
     isok(lnn::LineTypes) = !iszero(lnn.line) || lnn.file !== :none   # might fail either one, but accept anything
 
     mod = moduleof(frame)
@@ -282,7 +292,16 @@ function _methods_by_execution!(
     modinclude = isdefined(mod, :include) ? getglobal(mod, :include) : nothing
     signatures = MethodInfoKey[]  # temporary for method signature storage
     pc = frame.pc
+    _mbe_iteration_count[] = 0
     while true
+        _mbe_iteration_count[] += 1
+        if _mbe_iteration_count[] > _mbe_max_iterations
+            @error "[REVISE DEBUG] _methods_by_execution! MAX ITERATIONS EXCEEDED" iterations=_mbe_iteration_count[] pc
+            break
+        end
+        if _mbe_iteration_count[] % 100 == 0
+            @info "[REVISE DEBUG] _methods_by_execution! loop iteration" iterations=_mbe_iteration_count[] pc
+        end
         JuliaInterpreter.is_leaf(frame) || (@warn("not a leaf"); break)
         stmt = pc_expr(frame, pc)
         if !isrequired[pc] && mode !== :eval && !(mode === :evalassign && LoweredCodeUtils.get_lhs_rhs(stmt) !== nothing)

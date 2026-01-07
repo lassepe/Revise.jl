@@ -335,19 +335,29 @@ function delete_missing!(
         exs_infos_old::ExprsInfos, exs_infos_new::ExprsInfos,
         reeval_list::IdSet{Union{Method,Type}}, handled_types::IdSet{Type}, world::UInt
     )
+    @info "[REVISE DEBUG] delete_missing!(ExprsInfos) called" old_count=length(exs_infos_old) new_count=length(exs_infos_new)
     with_logger(_debug_logger) do
+        deleted_count = 0
         for (rex, exinfos) in exs_infos_old
             haskey(exs_infos_new, rex) && continue
             # ex was deleted
+            deleted_count += 1
             exinfos === nothing && continue
-            for exinfo in exinfos
+            @info "[REVISE DEBUG] Processing deleted expression" deleted_count rex_summary=string(first(string(rex.ex), 80)) num_exinfos=length(exinfos)
+            for (info_idx, exinfo) in enumerate(exinfos)
+                @info "[REVISE DEBUG] Processing exinfo" info_idx exinfo_type=typeof(exinfo)
                 if exinfo isa SigInfo
+                    @info "[REVISE DEBUG] Handling method deletion" info_idx sig=exinfo.sig
                     handle_method_deletion!(exinfo, rex, world)
+                    @info "[REVISE DEBUG] Method deletion completed" info_idx
                 elseif __bpart__
+                    @info "[REVISE DEBUG] Handling type deletion" info_idx typename=exinfo.typname
                     handle_type_deletion!(exinfo::TypeInfo, reeval_list, handled_types, world)
+                    @info "[REVISE DEBUG] Type deletion completed" info_idx reeval_list_size=length(reeval_list) handled_types_size=length(handled_types)
                 end
             end
         end
+        @info "[REVISE DEBUG] delete_missing!(ExprsInfos) finished" deleted_count
     end
     return exs_infos_old
 end
@@ -417,32 +427,57 @@ function handle_type_deletion!(
         typeinfo::TypeInfo, reeval_list::IdSet{Union{Method,Type}}, handled_types::IdSet{Type}, world::UInt
     )
     oldtypename = typeinfo.typname
+    @info "[REVISE DEBUG] handle_type_deletion! called" oldtypename_mod=oldtypename.module oldtypename_name=oldtypename.name
     with_logger(_debug_logger) do
         old_list = copy(reeval_list)
+        @info "[REVISE DEBUG] Getting oldtype from world" world
         oldtype = Base.invoke_in_world(world, getglobal, oldtypename.module, oldtypename.name)::Type
+        @info "[REVISE DEBUG] Got oldtype" oldtype
+        @info "[REVISE DEBUG] Collecting all subtypes of Any..."
         alltypes = collect_all_subtypes(Any) # reuse cache for recursive searches performance (freezed at this world)
+        @info "[REVISE DEBUG] collect_all_subtypes(Any) returned" alltypes_count=length(alltypes)
+        @info "[REVISE DEBUG] Calling record_invalidations_for_type_deletion!..."
         record_invalidations_for_type_deletion!(oldtype, reeval_list, handled_types, alltypes)
+        @info "[REVISE DEBUG] record_invalidations_for_type_deletion! returned" reeval_list_size=length(reeval_list) handled_types_size=length(handled_types)
         diff = setdiff(reeval_list, old_list)
         @debug "DeleteType" _group="Action" time=time() deltainfo=(oldtype,diff)
     end
     return reeval_list
 end
 
+const _record_invalidations_depth = Ref(0)
+const _record_invalidations_max_depth = 50
+
 function record_invalidations_for_type_deletion!(
         @nospecialize(oldtype::Type), reeval_list::IdSet{Union{Method,Type}}, handled_types::IdSet{Type},
         alltypes::Base.IdSet{Type}
     )
+    _record_invalidations_depth[] += 1
+    depth = _record_invalidations_depth[]
+    @info "[REVISE DEBUG] record_invalidations_for_type_deletion! ENTER" depth oldtype handled_types_size=length(handled_types)
+    
+    if depth > _record_invalidations_max_depth
+        @error "[REVISE DEBUG] MAX RECURSION DEPTH EXCEEDED" depth oldtype
+        _record_invalidations_depth[] -= 1
+        return
+    end
+    
     push!(handled_types, oldtype)
 
     olddatatype = Base.unwrap_unionall(oldtype)::DataType
     oldtypename = olddatatype.name
+    @info "[REVISE DEBUG] Processing type" depth oldtypename_mod=oldtypename.module oldtypename_name=oldtypename.name
 
     # Find all methods restricted to `oldtype`
+    @info "[REVISE DEBUG] Calling old_methods_with..." depth
     meths = old_methods_with(oldtypename)
+    @info "[REVISE DEBUG] old_methods_with returned" depth meths_count=(meths === nothing ? 0 : length(meths))
     meths !== nothing && union!(reeval_list, meths)
 
     # Find all types using `oldtype`
+    @info "[REVISE DEBUG] Calling old_types_with..." depth
     related_types = old_types_with(oldtypename, alltypes)
+    @info "[REVISE DEBUG] old_types_with returned" depth related_types_count=(related_types === nothing ? 0 : length(related_types))
     related_types !== nothing && union!(reeval_list, related_types)
 
     # For any modules that have not yet been parsed and had their signatures extracted,
@@ -451,31 +486,43 @@ function record_invalidations_for_type_deletion!(
     related_types !== nothing && maybe_extract_sigs_for_types(related_types)
 
     # If `oldtype` is an abstract type, we need to traverse its subtypes and invalidate them
+    @info "[REVISE DEBUG] Collecting subtypes of oldtype..." depth oldtype
     oldsubtypes = collect_all_subtypes(oldtype)
+    @info "[REVISE DEBUG] collect_all_subtypes returned" depth oldsubtypes_count=length(oldsubtypes)
     maybe_extract_sigs_for_types(oldsubtypes)
-    for oldsubtype in oldsubtypes
+    for (idx, oldsubtype) in enumerate(oldsubtypes)
         oldsubtype in handled_types && continue
+        @info "[REVISE DEBUG] Processing subtype" depth idx oldsubtype
         push!(reeval_list, oldsubtype)
         record_invalidations_for_type_deletion!(oldsubtype, reeval_list, handled_types, alltypes)
     end
 
     # `related_types` will also be recursively redefined, so we need to invalidate methods/types related to them as well
-    related_types !== nothing && for related_type in related_types
+    @info "[REVISE DEBUG] Processing related_types" depth related_types_count=(related_types === nothing ? 0 : length(related_types))
+    related_types !== nothing && for (idx, related_type) in enumerate(related_types)
         related_type in handled_types && continue
+        @info "[REVISE DEBUG] Processing related_type" depth idx related_type
         record_invalidations_for_type_deletion!(related_type, reeval_list, handled_types, alltypes)
     end
+    
+    @info "[REVISE DEBUG] record_invalidations_for_type_deletion! EXIT" depth oldtype
+    _record_invalidations_depth[] -= 1
 end
 
 function eval_rex(rex_new::RelocatableExpr, exs_infos_old::ExprsInfos, mod::Module; mode::Symbol=:eval)
+    @info "[REVISE DEBUG] eval_rex called" mod mode rex_summary=string(first(string(rex_new.ex), 80))
     return with_logger(_debug_logger) do
         exinfos, includes = nothing, nothing
         rex_old = getkey(exs_infos_old, rex_new, nothing)
+        @info "[REVISE DEBUG] eval_rex: rex_old lookup" is_new=(rex_old === nothing)
         # extract the signatures and update the line info
         if rex_old === nothing
             ex = rex_new.ex
             # ex is not present in old
             @debug titlecase(String(mode)) _group="Action" time=time() deltainfo=(mod, ex, mode)
+            @info "[REVISE DEBUG] eval_rex: Calling eval_with_signatures for NEW expression..."
             exinfos, includes, thunk = eval_with_signatures(mod, ex; mode)  # All signatures defined by `ex`
+            @info "[REVISE DEBUG] eval_rex: eval_with_signatures returned" has_exinfos=(exinfos !== nothing) has_includes=(includes !== nothing)
             if !isexpr(thunk, :thunk)
                 thunk = ex
             end
@@ -514,6 +561,7 @@ function eval_rex(rex_new::RelocatableExpr, exs_infos_old::ExprsInfos, mod::Modu
                 end
             end
         end
+        @info "[REVISE DEBUG] eval_rex returning" has_exinfos=(exinfos !== nothing) has_includes=(includes !== nothing)
         return exinfos, includes
     end
 end
@@ -550,10 +598,14 @@ end
 
 # Eval and insert into CodeTracking data
 function eval_with_signatures(mod::Module, ex::Expr; mode::Symbol=:eval, kwargs...)
+    @info "[REVISE DEBUG] eval_with_signatures called" mod mode ex_summary=string(first(string(ex), 80))
     exinfo = ExInfo(ex)
+    @info "[REVISE DEBUG] eval_with_signatures: Calling methods_by_execution!..."
     _, thk = methods_by_execution!(exinfo, mod, ex; mode, kwargs...)
+    @info "[REVISE DEBUG] eval_with_signatures: methods_by_execution! returned"
     exinfos = Union{SigInfo,TypeInfo}[]
     append!(exinfos, exinfo.allsigs, exinfo.typeinfos)
+    @info "[REVISE DEBUG] eval_with_signatures returning" num_sigs=length(exinfo.allsigs) num_types=length(exinfo.typeinfos) num_includes=length(exinfo.includes)
     return exinfos, exinfo.includes, thk
 end
 
@@ -726,8 +778,11 @@ function handle_deletions(
         pkgdata::PkgData, file::AbstractString,
         reeval_list::IdSet{Union{Method,Type}}, handled_types::IdSet{Type}, world::UInt
     )
+    @info "[REVISE DEBUG] handle_deletions called" file
     fi = maybe_parse_from_cache!(pkgdata, file)
+    @info "[REVISE DEBUG] maybe_parse_from_cache! returned" file
     maybe_extract_sigs!(fi)
+    @info "[REVISE DEBUG] maybe_extract_sigs! returned" file
     mod_exs_infos_old = fi.mod_exs_infos
     idx = fileindex(pkgdata, file)
     filep = pkgdata.info.files[idx]
@@ -740,9 +795,13 @@ function handle_deletions(
     end
     topmod = first(keys(mod_exs_infos_old))
     fileok = file_exists(String(filep)::String)
+    @info "[REVISE DEBUG] Parsing source" file fileok topmod
     mod_exs_infos_new = fileok ? parse_source(filep, topmod) : ModuleExprsInfos(topmod)
+    @info "[REVISE DEBUG] parse_source returned" file mod_exs_infos_new_type=typeof(mod_exs_infos_new)
     if mod_exs_infos_new !== nothing && mod_exs_infos_new !== DoNotParse()
+        @info "[REVISE DEBUG] Calling delete_missing!" file
         delete_missing!(mod_exs_infos_old, mod_exs_infos_new, reeval_list, handled_types, world)
+        @info "[REVISE DEBUG] delete_missing! returned" file reeval_list_size=length(reeval_list) handled_types_size=length(handled_types)
     end
     if !fileok
         @warn("$filep no longer exists, deleted all methods")
@@ -770,6 +829,7 @@ struct ReevalInfo
 end
 
 function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reeval_list::IdSet{Union{Method,Type}}, world::UInt)
+    @info "[REVISE DEBUG] redefine_bindings! called" reeval_list_size=length(reeval_list) world
     reeval_infos = ReevalInfo[]
 
     # N.B. This traverse could become expensive when Revise tracked code becomes large
@@ -777,7 +837,13 @@ function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reev
     # type information as well as index information to `pkgdatas` into the `CodeTracking.method_info` cache,
     # and updating `CodeTracking.ex_info` in sync with `pkgdatas` updates,
     # then performing lookups to `CodeTracking.ex_info` instead
+    @info "[REVISE DEBUG] Traversing pkgdatas..." num_pkgdatas=length(pkgdatas)
+    pkgdata_count = 0
     for (_, pkgdata) in pkgdatas
+        pkgdata_count += 1
+        if pkgdata_count % 10 == 0
+            @info "[REVISE DEBUG] redefine_bindings! pkgdata progress" pkgdata_count
+        end
         for (file, fileinfo) in zip(srcfiles(pkgdata), pkgdata.fileinfos)
             for (mod, exs_infos) in fileinfo.mod_exs_infos
                 for (rex, exinfos) in exs_infos
@@ -807,16 +873,29 @@ function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reev
             end
         end
     end
+    @info "[REVISE DEBUG] Traversal complete, found reeval_infos" count=length(reeval_infos)
+    
+    # Count types and methods
+    type_count = count(ri -> ri.reeval isa Type, reeval_infos)
+    method_count = count(ri -> ri.reeval isa Method, reeval_infos)
+    @info "[REVISE DEBUG] Processing types..." type_count
+    
+    type_idx = 0
     for (; reeval, mod, exs_infos, rex, pkgdata, file) in reeval_infos
         reeval isa Type || continue
+        type_idx += 1
+        @info "[REVISE DEBUG] Reeval type" type_idx reeval mod file
         with_logger(_debug_logger) do
             @debug "ReevalType" _group="Action" time=time() deltainfo=(reeval,mod,rex)
             try
+                @info "[REVISE DEBUG] Calling eval_with_signatures for type..." type_idx
                 newexinfos, _, _ = eval_with_signatures(mod, rex.ex; mode=:eval)
+                @info "[REVISE DEBUG] eval_with_signatures completed for type" type_idx
                 exs_infos[rex] = newexinfos
             catch err
                 # Re-evaluation failed, likely due to type incompatibility
                 # Clear exs_infos cache for this `rex` so that we will retry evaluation when methods become compatible
+                @error "[REVISE DEBUG] Reeval type failed" type_idx err
                 delete!(exs_infos, rex)
                 @debug "ReevalTypeFailed" _group="Action" time=time() deltainfo=(reeval,mod,rex,err)
                 push!(revision_errors, (pkgdata, file))
@@ -824,19 +903,27 @@ function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reev
             end
         end
     end
+    
+    @info "[REVISE DEBUG] Processing methods..." method_count
+    method_idx = 0
     for (; reeval, mod, exs_infos, rex, pkgdata, file) in reeval_infos
         reeval isa Method || continue
+        method_idx += 1
+        @info "[REVISE DEBUG] Reeval method" method_idx reeval_sig=reeval.sig mod file
         with_logger(_debug_logger) do
             @debug "ReevalDeleteMethod" _group="Action" time=time() deltainfo=(reeval.sig, MethodSummary(reeval))
             # ensure that "old data" doesn't get run with "old methods"
             try Base.delete_method(reeval) catch end
             @debug "ReevalMethod" _group="Action" time=time() deltainfo=(reeval, reeval.module, rex)
             try
+                @info "[REVISE DEBUG] Calling eval_with_signatures for method..." method_idx
                 newexinfos, _, _ = eval_with_signatures(mod, rex.ex; mode=:eval)
+                @info "[REVISE DEBUG] eval_with_signatures completed for method" method_idx
                 exs_infos[rex] = newexinfos
             catch err
                 # Re-evaluation failed, likely due to type incompatibility
                 # Clear exs_infos cache for this `rex` so that we will retry evaluation when methods become compatible
+                @error "[REVISE DEBUG] Reeval method failed" method_idx err
                 delete!(exs_infos, rex)
                 @debug "ReevalMethodFailed" _group="Action" time=time() deltainfo=(reeval,mod,rex,err)
                 push!(revision_errors, (pkgdata, file))
@@ -844,6 +931,7 @@ function redefine_bindings!(revision_errors::Vector{Tuple{PkgData,String}}, reev
             end
         end
     end
+    @info "[REVISE DEBUG] redefine_bindings! completed"
     return revision_errors
 end
 
@@ -924,10 +1012,12 @@ If `throw` is `true`, throw any errors that occur during revision or callback;
 otherwise these are only logged.
 """
 function revise(; throw::Bool=false)
+    @info "[REVISE DEBUG] revise() called" active=active[]
     active[] || return nothing
     sleep(0.01)  # in case the file system isn't quite done writing out the new files
 
     @lock revision_queue_lock begin
+        @info "[REVISE DEBUG] Inside revision_queue_lock" queue_size=length(revision_queue)
         have_queue_errors = !isempty(queue_errors)
 
         # Julia 1.12+: when bindings switch to a new type, we need to re-evaluate method
@@ -935,6 +1025,7 @@ function revise(; throw::Bool=false)
         reeval_list = IdSet{Union{Method,Type}}()
         handled_types = IdSet{Type}()
         world = Base.get_world_counter()
+        @info "[REVISE DEBUG] World counter" world __bpart__
 
         # Do all the deletion first. This ensures that a method that moved from one file to another
         # won't get redefined first and deleted second.
@@ -943,32 +1034,48 @@ function revise(; throw::Bool=false)
         finished = eltype(revision_queue)[]
         mod_exs_infos = ModuleExprsInfos[]
         interrupt = false
-        for (pkgdata, file) in queue
+        @info "[REVISE DEBUG] Processing deletion phase" num_items=length(queue)
+        for (idx, (pkgdata, file)) in enumerate(queue)
+            @info "[REVISE DEBUG] Deletion phase item" idx file pkgid=PkgId(pkgdata)
             try
+                @info "[REVISE DEBUG] Calling handle_deletions..." file
                 mod_exs_infos_new, _ = handle_deletions(pkgdata, file, reeval_list, handled_types, world)
+                @info "[REVISE DEBUG] handle_deletions returned" file reeval_list_size=length(reeval_list) handled_types_size=length(handled_types)
                 mod_exs_infos_new === DoNotParse() && continue
                 push!(mod_exs_infos, mod_exs_infos_new)
                 push!(finished, (pkgdata, file))
             catch err
+                @error "[REVISE DEBUG] Error in deletion phase" file err
                 throw && Base.throw(err)
                 interrupt |= isa(err, InterruptException)
                 push!(revision_errors, (pkgdata, file))
                 queue_errors[(pkgdata, file)] = (err, catch_backtrace())
             end
         end
+        @info "[REVISE DEBUG] Deletion phase completed" finished_count=length(finished)
 
         # Do the evaluation
-        for ((pkgdata, file), mod_exs_infos_new) in zip(finished, mod_exs_infos)
+        @info "[REVISE DEBUG] Starting evaluation phase" num_files=length(finished)
+        for (file_idx, ((pkgdata, file), mod_exs_infos_new)) in enumerate(zip(finished, mod_exs_infos))
+            @info "[REVISE DEBUG] Evaluation phase file" file_idx file
             defaultmode = PkgId(pkgdata).name == "Main" ? :evalmeth : :eval
             i = fileindex(pkgdata, file)
             i === nothing && continue   # file was deleted by `handle_deletions`
             fi = fileinfo(pkgdata, i)
             modsremaining = Set(keys(mod_exs_infos_new))
             changed, err = true, nothing
+            iteration_count = 0
             while changed
+                iteration_count += 1
+                @info "[REVISE DEBUG] Eval while loop iteration" file iteration_count modsremaining_count=length(modsremaining) mods=collect(modsremaining)
+                if iteration_count > 100
+                    @error "[REVISE DEBUG] POTENTIAL INFINITE LOOP DETECTED" file iteration_count modsremaining
+                    break
+                end
                 changed = false
                 for (mod, exs_infos_new) in mod_exs_infos_new
                     mod ∈ modsremaining || continue
+                    @info "[REVISE DEBUG] Processing module" mod num_expressions=length(exs_infos_new)
                     try
                         mode = defaultmode
                         # Allow packages to override the supplied mode
@@ -977,8 +1084,12 @@ function revise(; throw::Bool=false)
                         end
                         mode ∈ (:sigs, :eval, :evalmeth, :evalassign) || error("unsupported mode ", mode)
                         exs_infos_old = get(fi.mod_exs_infos, mod, empty_exs_infos)
+                        expr_count = 0
                         for rex in keys(exs_infos_new)
+                            expr_count += 1
+                            @info "[REVISE DEBUG] Evaluating expression" mod expr_count rex_summary=string(first(string(rex.ex), 80))
                             exinfos, includes = eval_rex(rex, exs_infos_old, mod; mode)
+                            @info "[REVISE DEBUG] eval_rex returned" expr_count has_exinfos=(exinfos !== nothing) has_includes=(includes !== nothing)
                             if exinfos !== nothing
                                 exs_infos_new[rex] = exinfos
                             end
@@ -988,11 +1099,14 @@ function revise(; throw::Bool=false)
                         end
                         delete!(modsremaining, mod)
                         changed = true
+                        @info "[REVISE DEBUG] Module completed" mod changed
                     catch e
+                        @error "[REVISE DEBUG] Error processing module" mod e
                         err = e
                     end
                 end
             end
+            @info "[REVISE DEBUG] Eval while loop finished" file iteration_count modsremaining_empty=isempty(modsremaining)
             if isempty(modsremaining) || isa(err, LoweringException)   # fix #877
                 pkgdata.fileinfos[i] = FileInfo(mod_exs_infos_new, fi)
             end
@@ -1007,8 +1121,11 @@ function revise(; throw::Bool=false)
         end
 
         # Do binding redefinitions
+        @info "[REVISE DEBUG] Checking binding redefinitions" __bpart__ reeval_list_size=length(reeval_list)
         if __bpart__
+            @info "[REVISE DEBUG] Calling redefine_bindings!..." reeval_list_size=length(reeval_list)
             redefine_bindings!(revision_errors, reeval_list, world)
+            @info "[REVISE DEBUG] redefine_bindings! completed"
         end
 
         # Error handling
@@ -1039,9 +1156,12 @@ function revise(; throw::Bool=false)
         end
         tracking_Main_includes[] && queue_includes(Main)
 
+        @info "[REVISE DEBUG] Processing user callbacks..."
         process_user_callbacks!(; throw)
+        @info "[REVISE DEBUG] User callbacks completed"
     end
 
+    @info "[REVISE DEBUG] revise() completed successfully"
     nothing
 end
 revise(::REPL.REPLBackend) = revise()
